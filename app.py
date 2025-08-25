@@ -1,27 +1,22 @@
 import streamlit as st
-from typing import List, Dict, Any, Optional, Literal
-from langchain_community.tools import WikipediaQueryRun, ArxivQueryRun, DuckDuckGoSearchRun
-from langchain_community.utilities import WikipediaAPIWrapper, ArxivAPIWrapper
-from langchain_groq import ChatGroq
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
-from langchain.prompts import PromptTemplate
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from typing_extensions import TypedDict
+import openai
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 import json
-import os
+import io
+import PyPDF2
+import docx
 from datetime import datetime
-import traceback
-from pathlib import Path
-import pickle
+import plotly.express as px
+import plotly.graph_objects as go
+from typing import List, Dict, Tuple
+import re
 
 # Page configuration
 st.set_page_config(
-    page_title="🧠 LangGraph Smart Router",
-    page_icon="🔄",
+    page_title="Resume Matcher AI",
+    page_icon="🎯",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -32,593 +27,562 @@ st.markdown("""
     .main-header {
         font-size: 3rem;
         font-weight: bold;
-        background: linear-gradient(90deg, #667eea, #764ba2);
+        text-align: center;
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
-        text-align: center;
-        margin-bottom: 1rem;
+        margin-bottom: 2rem;
     }
-    
-    .route-indicator {
-        padding: 0.5rem 1rem;
-        border-radius: 20px;
-        color: white;
-        font-weight: bold;
-        margin: 0.5rem 0;
-        text-align: center;
-    }
-    
-    .local-route {
-        background: linear-gradient(45deg, #4CAF50, #45a049);
-    }
-    
-    .external-route {
-        background: linear-gradient(45deg, #2196F3, #1976d2);
-    }
-    
-    .hybrid-route {
-        background: linear-gradient(45deg, #FF9800, #f57c00);
-    }
-    
-    .graph-node {
-        background: #f8f9fa;
-        border: 2px solid #e9ecef;
-        border-radius: 10px;
+    .metric-card {
+        background: white;
         padding: 1rem;
-        margin: 0.5rem;
+        border-radius: 10px;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        border-left: 4px solid #667eea;
     }
-    
-    .active-node {
-        border-color: #007bff;
-        background: #e7f3ff;
+    .match-score {
+        font-size: 2rem;
+        font-weight: bold;
+        color: #667eea;
     }
-    
-    .step-indicator {
-        background: linear-gradient(45deg, #667eea, #764ba2);
-        color: white;
-        padding: 0.3rem 0.8rem;
-        border-radius: 15px;
-        font-size: 0.8rem;
-        margin-right: 0.5rem;
+    .sidebar-section {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 1rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# Define the state for our graph
-class GraphState(TypedDict):
-    query: str
-    route_decision: Optional[str]
-    local_results: Optional[List[Dict]]
-    external_results: Optional[str]
-    final_answer: Optional[str]
-    context: Optional[str]
-    step_history: List[str]
-
-class LocalDataManager:
-    """Manages local knowledge base with vector search"""
-    
+class ResumeMatcherAI:
     def __init__(self):
-        self.vector_store = None
-        self.documents = []
-        self.embeddings = None
+        self.client = None
+        self.job_descriptions = []
+        self.resumes = []
+        self.embeddings_cache = {}
         
-    def initialize_embeddings(self, openai_api_key: str = None):
-        """Initialize embeddings - try OpenAI first, then fallback"""
+    def initialize_openai(self, api_key: str):
+        """Initialize OpenAI client"""
         try:
-            if openai_api_key:
-                self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
-            else:
-                # Fallback to a free alternative (you might want to use a local model)
-                st.warning("Using basic text similarity (OpenAI embeddings not available)")
-                return False
+            openai.api_key = api_key
+            self.client = openai.OpenAI(api_key=api_key)
             return True
         except Exception as e:
-            st.error(f"Failed to initialize embeddings: {e}")
+            st.error(f"Error initializing OpenAI: {str(e)}")
             return False
     
-    def load_sample_data(self):
-        """Load sample knowledge base"""
-        sample_docs = [
-            {
-                "content": "Python is a high-level programming language known for its simplicity and readability. It was created by Guido van Rossum in 1991.",
-                "metadata": {"topic": "programming", "language": "python"}
-            },
-            {
-                "content": "Machine Learning is a subset of artificial intelligence that enables computers to learn from data without explicit programming. Common algorithms include linear regression, decision trees, and neural networks.",
-                "metadata": {"topic": "machine_learning", "category": "ai"}
-            },
-            {
-                "content": "Streamlit is an open-source app framework for Machine Learning and Data Science projects. It allows you to create web apps with simple Python scripts.",
-                "metadata": {"topic": "programming", "framework": "streamlit"}
-            },
-            {
-                "content": "LangChain is a framework for developing applications powered by language models. It provides tools for prompt management, chains, and agents.",
-                "metadata": {"topic": "ai", "framework": "langchain"}
-            },
-            {
-                "content": "Vector databases store high-dimensional vectors and enable similarity search. They are essential for RAG (Retrieval Augmented Generation) applications.",
-                "metadata": {"topic": "databases", "category": "vector"}
-            }
-        ]
-        
-        self.documents = [
-            Document(page_content=doc["content"], metadata=doc["metadata"]) 
-            for doc in sample_docs
-        ]
-        
-        return len(self.documents)
-    
-    def create_vector_store(self):
-        """Create vector store from documents"""
-        if not self.embeddings or not self.documents:
-            return False
-            
+    def extract_text_from_pdf(self, pdf_file) -> str:
+        """Extract text from PDF file"""
         try:
-            self.vector_store = FAISS.from_documents(self.documents, self.embeddings)
-            return True
+            pdf_reader = PyPDF2.PdfReader(pdf_file)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text() + "\n"
+            return text
         except Exception as e:
-            st.error(f"Failed to create vector store: {e}")
-            return False
+            st.error(f"Error extracting PDF text: {str(e)}")
+            return ""
     
-    def search_local(self, query: str, k: int = 3) -> List[Dict]:
-        """Search local knowledge base"""
-        if not self.vector_store:
-            return []
+    def extract_text_from_docx(self, docx_file) -> str:
+        """Extract text from DOCX file"""
+        try:
+            doc = docx.Document(docx_file)
+            text = ""
+            for paragraph in doc.paragraphs:
+                text += paragraph.text + "\n"
+            return text
+        except Exception as e:
+            st.error(f"Error extracting DOCX text: {str(e)}")
+            return ""
+    
+    def get_embeddings(self, text: str) -> np.ndarray:
+        """Get OpenAI embeddings for text"""
+        if not self.client:
+            return np.array([])
+        
+        # Check cache first
+        text_hash = hash(text)
+        if text_hash in self.embeddings_cache:
+            return self.embeddings_cache[text_hash]
         
         try:
-            results = self.vector_store.similarity_search_with_score(query, k=k)
-            
-            return [
-                {
-                    "content": doc.page_content,
-                    "metadata": doc.metadata,
-                    "score": float(score)
-                }
-                for doc, score in results
-            ]
+            response = self.client.embeddings.create(
+                model="text-embedding-ada-002",
+                input=text
+            )
+            embedding = np.array(response.data[0].embedding)
+            self.embeddings_cache[text_hash] = embedding
+            return embedding
         except Exception as e:
-            st.error(f"Local search error: {e}")
-            return []
-
-class ExternalTools:
-    """Manages external search tools"""
+            st.error(f"Error getting embeddings: {str(e)}")
+            return np.array([])
     
-    def __init__(self):
-        self.tools = {}
-        self._initialize_tools()
+    def calculate_similarity_score(self, resume_text: str, job_text: str) -> float:
+        """Calculate similarity score between resume and job description"""
+        resume_embedding = self.get_embeddings(resume_text)
+        job_embedding = self.get_embeddings(job_text)
+        
+        if resume_embedding.size == 0 or job_embedding.size == 0:
+            return 0.0
+        
+        similarity = cosine_similarity(
+            resume_embedding.reshape(1, -1),
+            job_embedding.reshape(1, -1)
+        )[0][0]
+        
+        return float(similarity * 100)  # Convert to percentage
     
-    def _initialize_tools(self):
-        """Initialize external search tools"""
-        try:
-            # Wikipedia tool
-            wiki_wrapper = WikipediaAPIWrapper(top_k_results=2, doc_content_chars_max=1500)
-            self.tools['wikipedia'] = WikipediaQueryRun(api_wrapper=wiki_wrapper)
-            
-            # ArXiv tool
-            arxiv_wrapper = ArxivAPIWrapper(top_k_results=2, doc_content_chars_max=1500)
-            self.tools['arxiv'] = ArxivQueryRun(api_wrapper=arxiv_wrapper)
-            
-            # Web search tool
-            self.tools['web_search'] = DuckDuckGoSearchRun()
-            
-        except Exception as e:
-            st.error(f"Failed to initialize external tools: {e}")
-    
-    def search_external(self, query: str, tool_name: str) -> str:
-        """Search using external tools"""
-        if tool_name not in self.tools:
-            return f"Tool {tool_name} not available"
+    def extract_skills_and_keywords(self, text: str) -> Dict[str, List[str]]:
+        """Extract skills and keywords using GPT-4"""
+        if not self.client:
+            return {"skills": [], "keywords": []}
         
         try:
-            result = self.tools[tool_name].run(query)
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert HR assistant. Extract technical skills, soft skills, and important keywords from the given text. Return as JSON with 'skills' and 'keywords' arrays."},
+                    {"role": "user", "content": f"Extract skills and keywords from this text:\n\n{text[:2000]}"}
+                ],
+                max_tokens=500,
+                temperature=0.3
+            )
+            
+            result = json.loads(response.choices[0].message.content)
             return result
         except Exception as e:
-            return f"External search error: {str(e)}"
+            st.error(f"Error extracting skills: {str(e)}")
+            return {"skills": [], "keywords": []}
+    
+    def generate_cover_letter(self, resume_text: str, job_description: str, candidate_name: str = "Candidate") -> str:
+        """Generate tailored cover letter using GPT-4"""
+        if not self.client:
+            return "OpenAI client not initialized."
+        
+        try:
+            prompt = f"""
+            Generate a professional cover letter based on the following:
+            
+            Candidate Name: {candidate_name}
+            Resume: {resume_text[:1500]}
+            Job Description: {job_description[:1500]}
+            
+            Requirements:
+            - Professional tone
+            - Highlight relevant experience
+            - Show enthusiasm for the role
+            - Keep it concise (3-4 paragraphs)
+            - Include specific examples from the resume
+            """
+            
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert career counselor who writes compelling cover letters."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
+                temperature=0.7
+            )
+            
+            return response.choices[0].message.content
+        except Exception as e:
+            st.error(f"Error generating cover letter: {str(e)}")
+            return "Error generating cover letter."
+    
+    def generate_improvement_suggestions(self, resume_text: str, job_description: str) -> str:
+        """Generate resume improvement suggestions using GPT-4"""
+        if not self.client:
+            return "OpenAI client not initialized."
+        
+        try:
+            prompt = f"""
+            Analyze this resume against the job description and provide specific improvement suggestions:
+            
+            Resume: {resume_text[:1500]}
+            Job Description: {job_description[:1500]}
+            
+            Provide suggestions for:
+            1. Missing skills to add
+            2. Keywords to include
+            3. Experience to emphasize
+            4. Format improvements
+            5. Content gaps to address
+            
+            Be specific and actionable.
+            """
+            
+            response = self.client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are an expert resume consultant providing detailed, actionable feedback."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1000,
+                temperature=0.5
+            )
+            
+            return response.choices[0].message.content
+        except Exception as e:
+            st.error(f"Error generating suggestions: {str(e)}")
+            return "Error generating suggestions."
 
-class LangGraphRouter:
-    """Main LangGraph router class"""
-    
-    def __init__(self, groq_api_key: str, openai_api_key: str = None):
-        self.llm = ChatGroq(
-            groq_api_key=groq_api_key,
-            model_name="mixtral-8x7b-32768",
-            temperature=0.1
-        )
-        self.local_manager = LocalDataManager()
-        self.external_tools = ExternalTools()
-        self.graph = None
-        
-        # Initialize local data
-        if openai_api_key:
-            if self.local_manager.initialize_embeddings(openai_api_key):
-                self.local_manager.load_sample_data()
-                self.local_manager.create_vector_store()
-    
-    def route_query(self, state: GraphState) -> GraphState:
-        """Decide whether to use local search, external tools, or both"""
-        
-        query = state["query"]
-        
-        # Router prompt
-        router_prompt = PromptTemplate(
-            template="""
-            You are a routing system that decides how to answer user queries.
-            
-            Query: {query}
-            
-            Based on the query, decide the best approach:
-            - "local": If the query is about programming, AI/ML basics, or technical concepts that might be in our knowledge base
-            - "external": If the query needs current information, specific facts, or recent news
-            - "hybrid": If the query would benefit from both local knowledge and external information
-            
-            Available local topics: Python, Machine Learning, Streamlit, LangChain, Vector Databases
-            
-            Respond with only one word: local, external, or hybrid
-            """,
-            input_variables=["query"]
-        )
-        
-        try:
-            response = self.llm.invoke(router_prompt.format(query=query))
-            route = response.content.strip().lower()
-            
-            if route not in ["local", "external", "hybrid"]:
-                route = "hybrid"  # Default fallback
-            
-            state["route_decision"] = route
-            state["step_history"].append(f"🔄 Routed to: {route}")
-            
-        except Exception as e:
-            state["route_decision"] = "hybrid"
-            state["step_history"].append(f"❌ Router error, using hybrid: {str(e)}")
-        
-        return state
-    
-    def search_local_node(self, state: GraphState) -> GraphState:
-        """Search local knowledge base"""
-        
-        if state["route_decision"] not in ["local", "hybrid"]:
-            return state
-        
-        query = state["query"]
-        results = self.local_manager.search_local(query, k=3)
-        
-        state["local_results"] = results
-        
-        if results:
-            state["step_history"].append(f"📚 Found {len(results)} local results")
-        else:
-            state["step_history"].append("📚 No local results found")
-        
-        return state
-    
-    def search_external_node(self, state: GraphState) -> GraphState:
-        """Search external sources"""
-        
-        if state["route_decision"] not in ["external", "hybrid"]:
-            return state
-        
-        query = state["query"]
-        
-        # Determine best external tool based on query
-        if "research" in query.lower() or "paper" in query.lower():
-            tool = "arxiv"
-        elif "current" in query.lower() or "news" in query.lower() or "recent" in query.lower():
-            tool = "web_search"
-        else:
-            tool = "wikipedia"
-        
-        result = self.external_tools.search_external(query, tool)
-        state["external_results"] = result
-        state["step_history"].append(f"🌐 Searched {tool}")
-        
-        return state
-    
-    def synthesize_answer(self, state: GraphState) -> GraphState:
-        """Combine results and generate final answer"""
-        
-        query = state["query"]
-        local_results = state.get("local_results", [])
-        external_results = state.get("external_results", "")
-        
-        # Build context
-        context_parts = []
-        
-        if local_results:
-            local_context = "\n".join([f"Local: {result['content']}" for result in local_results])
-            context_parts.append(f"LOCAL KNOWLEDGE:\n{local_context}")
-        
-        if external_results:
-            context_parts.append(f"EXTERNAL INFORMATION:\n{external_results}")
-        
-        context = "\n\n".join(context_parts) if context_parts else "No specific information found."
-        state["context"] = context
-        
-        # Generate final answer
-        synthesis_prompt = PromptTemplate(
-            template="""
-            Based on the following information, provide a comprehensive and accurate answer to the user's question.
-            
-            Question: {query}
-            
-            Available Information:
-            {context}
-            
-            Instructions:
-            1. Synthesize information from all sources
-            2. Clearly indicate if information is from local knowledge vs external sources
-            3. If no relevant information is found, say so honestly
-            4. Provide a helpful and informative response
-            
-            Answer:
-            """,
-            input_variables=["query", "context"]
-        )
-        
-        try:
-            response = self.llm.invoke(synthesis_prompt.format(query=query, context=context))
-            state["final_answer"] = response.content
-            state["step_history"].append("✅ Generated final answer")
-            
-        except Exception as e:
-            state["final_answer"] = f"I apologize, but I encountered an error while generating the response: {str(e)}"
-            state["step_history"].append(f"❌ Synthesis error: {str(e)}")
-        
-        return state
-    
-    def create_graph(self):
-        """Create the LangGraph workflow"""
-        
-        workflow = StateGraph(GraphState)
-        
-        # Add nodes
-        workflow.add_node("route", self.route_query)
-        workflow.add_node("local_search", self.search_local_node)
-        workflow.add_node("external_search", self.search_external_node)
-        workflow.add_node("synthesize", self.synthesize_answer)
-        
-        # Add edges
-        workflow.set_entry_point("route")
-        workflow.add_edge("route", "local_search")
-        workflow.add_edge("route", "external_search")
-        workflow.add_edge("local_search", "synthesize")
-        workflow.add_edge("external_search", "synthesize")
-        workflow.add_edge("synthesize", END)
-        
-        self.graph = workflow.compile()
-    
-    def process_query(self, query: str) -> Dict[str, Any]:
-        """Process a query through the graph"""
-        
-        if not self.graph:
-            self.create_graph()
-        
-        # Initialize state
-        initial_state: GraphState = {
-            "query": query,
-            "route_decision": None,
-            "local_results": None,
-            "external_results": None,
-            "final_answer": None,
-            "context": None,
-            "step_history": []
-        }
-        
-        try:
-            # Run the graph
-            final_state = self.graph.invoke(initial_state)
-            return final_state
-            
-        except Exception as e:
-            return {
-                "query": query,
-                "route_decision": "error",
-                "local_results": None,
-                "external_results": None,
-                "final_answer": f"An error occurred: {str(e)}",
-                "context": None,
-                "step_history": [f"❌ Graph execution error: {str(e)}"]
-            }
+# Initialize the app
+@st.cache_resource
+def get_resume_matcher():
+    return ResumeMatcherAI()
 
 def main():
-    # Header
-    st.markdown('<div class="main-header">🧠 LangGraph Smart Router</div>', unsafe_allow_html=True)
-    st.markdown("*Intelligent query routing with local knowledge base and external tools*")
+    st.markdown('<h1 class="main-header">🎯 Resume Matcher AI</h1>', unsafe_allow_html=True)
+    st.markdown("**Semantic resume ranking with AI-powered insights**")
     
-    # Sidebar
+    matcher = get_resume_matcher()
+    
+    # Sidebar configuration
     with st.sidebar:
-        st.title("⚙️ Configuration")
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        st.header("⚙️ Configuration")
         
-        # API Keys
-        groq_api_key = st.text_input(
-            "Groq API Key",
-            type="password",
-            placeholder="gsk_...",
-            help="Required for LLM routing and synthesis"
-        )
-        
-        openai_api_key = st.text_input(
-            "OpenAI API Key (Optional)",
+        # OpenAI API Key
+        api_key = st.text_input(
+            "OpenAI API Key",
             type="password",
             placeholder="sk-...",
-            help="For better local embeddings. If not provided, external tools only."
+            help="Enter your OpenAI API key for embeddings and GPT-4"
         )
         
-        st.markdown("---")
+        if api_key and not matcher.client:
+            if matcher.initialize_openai(api_key):
+                st.success("✅ OpenAI initialized!")
+            else:
+                st.error("❌ Failed to initialize OpenAI")
         
-        # System Status
-        st.markdown("### 🔧 System Status")
+        st.markdown('</div>', unsafe_allow_html=True)
         
-        if groq_api_key:
-            st.success("✅ Groq API Connected")
-        else:
-            st.error("❌ Groq API Key Required")
-        
-        if openai_api_key:
-            st.success("✅ Local Search Available")
-        else:
-            st.warning("⚠️ Local Search Disabled")
-        
-        st.markdown("---")
-        
-        # Sample Data Info
-        with st.expander("📚 Local Knowledge Base"):
-            st.markdown("""
-            **Available Topics:**
-            - Python Programming
-            - Machine Learning Basics
-            - Streamlit Framework
-            - LangChain Framework  
-            - Vector Databases
-            
-            **Sample Questions:**
-            - "What is Python?"
-            - "Explain machine learning"
-            - "How does Streamlit work?"
-            """)
-        
-        # Clear chat
-        if st.button("🗑️ Clear Chat", type="secondary"):
-            if "messages" in st.session_state:
-                st.session_state.messages = []
-            st.rerun()
+        # Navigation
+        st.markdown('<div class="sidebar-section">', unsafe_allow_html=True)
+        st.header("📋 Navigation")
+        page = st.selectbox(
+            "Select Page",
+            ["Resume Matching", "Bulk Analysis", "Cover Letter Generator", "Resume Insights"]
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
     
-    # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {
-                "role": "assistant",
-                "content": "Hello! I'm your intelligent assistant with access to both local knowledge and external tools. Ask me anything!"
-            }
-        ]
+    if page == "Resume Matching":
+        show_resume_matching(matcher)
+    elif page == "Bulk Analysis":
+        show_bulk_analysis(matcher)
+    elif page == "Cover Letter Generator":
+        show_cover_letter_generator(matcher)
+    elif page == "Resume Insights":
+        show_resume_insights(matcher)
+
+def show_resume_matching(matcher):
+    st.header("🎯 Resume-Job Matching")
     
-    # Main chat interface
-    col1, col2 = st.columns([2, 1])
-    
-    with col2:
-        st.markdown("### 💡 Example Queries")
-        
-        examples = [
-            "What is Python programming?",
-            "Latest AI research papers",
-            "Current news about technology",
-            "Explain machine learning",
-            "How does vector search work?"
-        ]
-        
-        for example in examples:
-            if st.button(example, key=f"ex_{example[:15]}"):
-                st.session_state.example_query = example
+    col1, col2 = st.columns(2)
     
     with col1:
-        # Display chat history
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-                
-                # Show route info for assistant messages
-                if message["role"] == "assistant" and "route_info" in message:
-                    route = message["route_info"]["route_decision"]
-                    if route:
-                        route_class = f"{route}-route"
-                        st.markdown(
-                            f'<div class="route-indicator {route_class}">Route: {route.title()}</div>',
-                            unsafe_allow_html=True
-                        )
+        st.subheader("📄 Upload Resume")
+        resume_file = st.file_uploader(
+            "Choose resume file",
+            type=['pdf', 'docx', 'txt'],
+            key="resume_upload"
+        )
         
-        # Handle example selection
-        if hasattr(st.session_state, 'example_query'):
-            query = st.session_state.example_query
-            delattr(st.session_state, 'example_query')
-        else:
-            query = st.chat_input("Ask me anything...")
-        
-        if query:
-            # Validate API key
-            if not groq_api_key:
-                st.error("❌ Please provide your Groq API key in the sidebar")
-                return
+        resume_text = ""
+        if resume_file:
+            if resume_file.type == "application/pdf":
+                resume_text = matcher.extract_text_from_pdf(resume_file)
+            elif resume_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                resume_text = matcher.extract_text_from_docx(resume_file)
+            else:
+                resume_text = str(resume_file.read(), "utf-8")
             
-            # Add user message
-            st.session_state.messages.append({"role": "user", "content": query})
-            with st.chat_message("user"):
-                st.markdown(query)
-            
-            # Process query
-            with st.chat_message("assistant"):
-                with st.spinner("🧠 Processing query through LangGraph..."):
-                    
-                    # Initialize router
-                    router = LangGraphRouter(groq_api_key, openai_api_key)
-                    
-                    # Process query
-                    result = router.process_query(query)
-                    
-                    # Show processing steps
-                    with st.expander("🔍 Processing Steps", expanded=False):
-                        for step in result.get("step_history", []):
-                            st.markdown(f"<span class='step-indicator'>{step}</span>", unsafe_allow_html=True)
-                    
-                    # Display route decision
-                    route = result.get("route_decision", "unknown")
-                    route_class = f"{route}-route"
-                    st.markdown(
-                        f'<div class="route-indicator {route_class}">🎯 Route Decision: {route.title()}</div>',
-                        unsafe_allow_html=True
-                    )
-                    
-                    # Display results breakdown
-                    col_a, col_b = st.columns(2)
-                    
-                    with col_a:
-                        local_results = result.get("local_results", [])
-                        if local_results:
-                            st.markdown("**📚 Local Knowledge Found:**")
-                            for i, res in enumerate(local_results[:2]):
-                                st.markdown(f"• {res['content'][:100]}...")
-                    
-                    with col_b:
-                        external_results = result.get("external_results")
-                        if external_results:
-                            st.markdown("**🌐 External Information:**")
-                            st.markdown(f"• {external_results[:100]}...")
-                    
-                    # Display final answer
-                    final_answer = result.get("final_answer", "No answer generated")
-                    st.markdown("**🎯 Final Answer:**")
-                    st.markdown(final_answer)
-                    
-                    # Add to session state
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": final_answer,
-                        "route_info": result
-                    })
+            if resume_text:
+                st.success("✅ Resume uploaded successfully!")
+                with st.expander("Preview Resume Text"):
+                    st.text_area("Resume Content", resume_text[:500] + "...", height=200, disabled=True)
     
-    # Footer
-    st.markdown("---")
-    with st.expander("📖 How It Works"):
-        st.markdown("""
-        ### 🧠 LangGraph Workflow
+    with col2:
+        st.subheader("💼 Job Description")
+        job_text = st.text_area(
+            "Paste job description here",
+            placeholder="Enter the complete job description...",
+            height=200
+        )
         
-        1. **🔄 Router Node**: LLM decides whether to use local knowledge, external tools, or both
-        2. **📚 Local Search Node**: Searches vector database of local knowledge
-        3. **🌐 External Search Node**: Uses Wikipedia, ArXiv, or web search
-        4. **🎯 Synthesis Node**: Combines all information into a comprehensive answer
+        if job_text:
+            st.success("✅ Job description added!")
+    
+    if resume_text and job_text and matcher.client:
+        if st.button("🔍 Analyze Match", type="primary"):
+            with st.spinner("Analyzing resume match..."):
+                # Calculate similarity score
+                similarity_score = matcher.calculate_similarity_score(resume_text, job_text)
+                
+                # Extract skills
+                resume_skills = matcher.extract_skills_and_keywords(resume_text)
+                job_skills = matcher.extract_skills_and_keywords(job_text)
+                
+                # Display results
+                st.markdown("---")
+                st.subheader("📊 Match Results")
+                
+                # Similarity score
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown(f'<div class="metric-card"><div class="match-score">{similarity_score:.1f}%</div><div>Overall Match</div></div>', unsafe_allow_html=True)
+                
+                # Determine match quality
+                if similarity_score >= 75:
+                    match_quality = "Excellent"
+                    color = "green"
+                elif similarity_score >= 60:
+                    match_quality = "Good"
+                    color = "orange"
+                else:
+                    match_quality = "Fair"
+                    color = "red"
+                
+                with col2:
+                    st.markdown(f'<div class="metric-card"><div style="color: {color}; font-weight: bold; font-size: 1.5rem;">{match_quality}</div><div>Match Quality</div></div>', unsafe_allow_html=True)
+                
+                with col3:
+                    recommendation = "Strong Fit" if similarity_score >= 70 else "Consider" if similarity_score >= 50 else "Not Recommended"
+                    st.markdown(f'<div class="metric-card"><div style="font-weight: bold; font-size: 1.2rem;">{recommendation}</div><div>Recommendation</div></div>', unsafe_allow_html=True)
+                
+                # Skills analysis
+                st.subheader("🛠️ Skills Analysis")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**Resume Skills:**")
+                    for skill in resume_skills.get("skills", [])[:10]:
+                        st.write(f"• {skill}")
+                
+                with col2:
+                    st.write("**Job Requirements:**")
+                    for skill in job_skills.get("skills", [])[:10]:
+                        st.write(f"• {skill}")
+                
+                # Generate improvement suggestions
+                if st.button("💡 Get Improvement Suggestions"):
+                    with st.spinner("Generating suggestions..."):
+                        suggestions = matcher.generate_improvement_suggestions(resume_text, job_text)
+                        st.subheader("📝 Improvement Suggestions")
+                        st.write(suggestions)
+
+def show_bulk_analysis(matcher):
+    st.header("📊 Bulk Resume Analysis")
+    
+    st.info("Upload multiple resumes to analyze against a job description")
+    
+    # Job description input
+    job_text = st.text_area(
+        "Job Description",
+        placeholder="Paste the job description here...",
+        height=150
+    )
+    
+    # Multiple file upload
+    resume_files = st.file_uploader(
+        "Upload Multiple Resumes",
+        type=['pdf', 'docx', 'txt'],
+        accept_multiple_files=True,
+        key="bulk_resumes"
+    )
+    
+    if resume_files and job_text and matcher.client:
+        if st.button("🔄 Process All Resumes", type="primary"):
+            results = []
+            progress_bar = st.progress(0)
+            
+            for i, resume_file in enumerate(resume_files):
+                with st.spinner(f"Processing {resume_file.name}..."):
+                    # Extract text
+                    if resume_file.type == "application/pdf":
+                        resume_text = matcher.extract_text_from_pdf(resume_file)
+                    elif resume_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+                        resume_text = matcher.extract_text_from_docx(resume_file)
+                    else:
+                        resume_text = str(resume_file.read(), "utf-8")
+                    
+                    if resume_text:
+                        # Calculate similarity
+                        score = matcher.calculate_similarity_score(resume_text, job_text)
+                        
+                        results.append({
+                            "Resume": resume_file.name,
+                            "Match Score": score,
+                            "Recommendation": "Strong Fit" if score >= 70 else "Consider" if score >= 50 else "Not Recommended",
+                            "Text": resume_text[:500] + "..."
+                        })
+                
+                progress_bar.progress((i + 1) / len(resume_files))
+            
+            # Display results
+            if results:
+                st.subheader("📈 Analysis Results")
+                
+                # Sort by score
+                results_sorted = sorted(results, key=lambda x: x["Match Score"], reverse=True)
+                
+                # Create DataFrame
+                df = pd.DataFrame(results_sorted)
+                
+                # Display metrics
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    avg_score = df["Match Score"].mean()
+                    st.metric("Average Score", f"{avg_score:.1f}%")
+                
+                with col2:
+                    strong_fits = len(df[df["Match Score"] >= 70])
+                    st.metric("Strong Fits", strong_fits)
+                
+                with col3:
+                    total_resumes = len(df)
+                    st.metric("Total Analyzed", total_resumes)
+                
+                # Results table
+                st.dataframe(
+                    df[["Resume", "Match Score", "Recommendation"]],
+                    use_container_width=True
+                )
+                
+                # Visualization
+                fig = px.bar(
+                    df,
+                    x="Resume",
+                    y="Match Score",
+                    color="Recommendation",
+                    title="Resume Match Scores"
+                )
+                fig.update_xaxes(tickangle=45)
+                st.plotly_chart(fig, use_container_width=True)
+
+def show_cover_letter_generator(matcher):
+    st.header("✍️ AI Cover Letter Generator")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("👤 Candidate Information")
+        candidate_name = st.text_input("Candidate Name", placeholder="John Doe")
         
-        ### 🛠️ Available Tools
-        - **Local Vector Search**: Embedded knowledge base with similarity search
-        - **Wikipedia**: General knowledge and definitions
-        - **ArXiv**: Academic papers and research
-        - **DuckDuckGo**: Current web information
+        resume_file = st.file_uploader(
+            "Upload Resume",
+            type=['pdf', 'docx', 'txt'],
+            key="cover_letter_resume"
+        )
+    
+    with col2:
+        st.subheader("💼 Job Information")
+        job_description = st.text_area(
+            "Job Description",
+            placeholder="Paste job description...",
+            height=200
+        )
+    
+    resume_text = ""
+    if resume_file:
+        if resume_file.type == "application/pdf":
+            resume_text = matcher.extract_text_from_pdf(resume_file)
+        elif resume_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            resume_text = matcher.extract_text_from_docx(resume_file)
+        else:
+            resume_text = str(resume_file.read(), "utf-8")
+    
+    if candidate_name and resume_text and job_description and matcher.client:
+        if st.button("🚀 Generate Cover Letter", type="primary"):
+            with st.spinner("Generating personalized cover letter..."):
+                cover_letter = matcher.generate_cover_letter(
+                    resume_text, job_description, candidate_name
+                )
+                
+                st.subheader("📄 Generated Cover Letter")
+                st.write(cover_letter)
+                
+                # Download button
+                st.download_button(
+                    label="📥 Download Cover Letter",
+                    data=cover_letter,
+                    file_name=f"cover_letter_{candidate_name.replace(' ', '_')}.txt",
+                    mime="text/plain"
+                )
+
+def show_resume_insights(matcher):
+    st.header("🧠 Resume Insights & Analytics")
+    
+    resume_file = st.file_uploader(
+        "Upload Resume for Analysis",
+        type=['pdf', 'docx', 'txt'],
+        key="insights_resume"
+    )
+    
+    if resume_file and matcher.client:
+        # Extract text
+        if resume_file.type == "application/pdf":
+            resume_text = matcher.extract_text_from_pdf(resume_file)
+        elif resume_file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            resume_text = matcher.extract_text_from_docx(resume_file)
+        else:
+            resume_text = str(resume_file.read(), "utf-8")
         
-        ### 🚀 Benefits
-        - **Intelligent Routing**: Automatically chooses best information sources
-        - **Hybrid Approach**: Combines local knowledge with external tools
-        - **Transparent Process**: See exactly how your query is processed
-        - **Extensible**: Easy to add new tools and knowledge sources
-        """)
+        if resume_text:
+            with st.spinner("Analyzing resume..."):
+                # Extract skills and keywords
+                skills_data = matcher.extract_skills_and_keywords(resume_text)
+                
+                # Basic metrics
+                word_count = len(resume_text.split())
+                char_count = len(resume_text)
+                
+                # Display metrics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Word Count", word_count)
+                with col2:
+                    st.metric("Characters", char_count)
+                with col3:
+                    st.metric("Skills Found", len(skills_data.get("skills", [])))
+                with col4:
+                    st.metric("Keywords", len(skills_data.get("keywords", [])))
+                
+                # Skills breakdown
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("🛠️ Skills Identified")
+                    skills = skills_data.get("skills", [])
+                    if skills:
+                        for skill in skills[:15]:
+                            st.write(f"• {skill}")
+                    else:
+                        st.write("No skills identified")
+                
+                with col2:
+                    st.subheader("🔑 Key Terms")
+                    keywords = skills_data.get("keywords", [])
+                    if keywords:
+                        for keyword in keywords[:15]:
+                            st.write(f"• {keyword}")
+                    else:
+                        st.write("No keywords identified")
+                
+                # Text analysis
+                st.subheader("📊 Content Analysis")
+                
+                # Simple readability metrics
+                sentences = len([s for s in resume_text.split('.') if s.strip()])
+                avg_words_per_sentence = word_count / max(sentences, 1)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Sentences", sentences)
+                with col2:
+                    st.metric("Avg Words/Sentence", f"{avg_words_per_sentence:.1f}")
 
 if __name__ == "__main__":
     main()
